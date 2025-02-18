@@ -3217,6 +3217,8 @@ dependencies = [
  "ark-groth16",
  "ark-relations",
  "color-eyre",
+ "lazy_static",
+ "num_cpus",
  "rand",
  "rayon",
  "rln",

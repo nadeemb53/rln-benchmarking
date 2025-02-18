@@ -22,6 +22,9 @@ use color_eyre::Result;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::env;
+use num_cpus;
+use lazy_static;
 
 use rln::circuit::{Fr, TEST_TREE_HEIGHT, zkey_from_folder, vk_from_folder};
 use rln::poseidon_tree::PoseidonTree;
@@ -32,13 +35,27 @@ use zerokit_utils::merkle_tree::merkle_tree::ZerokitMerkleTree;
 
 const TPS: usize = 10;
 const TEST_DURATION_SECS: u64 = 10;
-const NUM_THREADS: usize = 8;
+lazy_static::lazy_static! {
+    static ref NUM_THREADS: usize = {
+        // Get threads from env var or calculate optimal number
+        match env::var("RLN_THREADS") {
+            Ok(threads) => threads.parse().unwrap_or_else(|_| get_optimal_threads()),
+            Err(_) => get_optimal_threads(),
+        }
+    };
+}
 const TOTAL_TRANSACTIONS: usize = TPS * TEST_DURATION_SECS as usize;
 
 fn print_section_header(title: &str) {
     println!("\n{}", "=".repeat(80));
     println!("  {}", title);
     println!("{}\n", "=".repeat(80));
+}
+
+fn get_optimal_threads() -> usize {
+    let available_threads = num_cpus::get();
+    // Use 75% of available threads, minimum of 1
+    std::cmp::max(1, (available_threads * 3) / 4)
 }
 
 fn benchmark_proof_generation(
@@ -157,7 +174,8 @@ fn main() -> Result<()> {
     println!("Target TPS: {}", TPS);
     println!("Duration: {} seconds", TEST_DURATION_SECS);
     println!("Total Transactions: {}", TOTAL_TRANSACTIONS);
-    println!("Parallel Threads: {}", NUM_THREADS);
+    println!("Available CPU Threads: {}", num_cpus::get());
+    println!("Using Threads: {}", *NUM_THREADS);
 
     print_section_header("Initialization");
     println!("Loading proving and verifying keys...");

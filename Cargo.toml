@@ -17,3 +17,5 @@ zerokit_utils = { git = "https://github.com/vacp2p/zerokit.git" }
 rand = "0.8.5"
 color-eyre = "0.6.2"
 rayon = "1.7"
+num_cpus = "1.16"
+lazy_static = "1.4"
