@@ -20,9 +20,8 @@ use std::time::{Duration, Instant};
 use std::collections::HashSet;
 use color_eyre::Result;
 use rayon::prelude::*;
-use std::sync::mpsc::channel;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rln::circuit::{Fr, TEST_TREE_HEIGHT, zkey_from_folder, vk_from_folder};
 use rln::poseidon_tree::PoseidonTree;
@@ -42,68 +41,57 @@ fn print_section_header(title: &str) {
     println!("{}\n", "=".repeat(80));
 }
 
-fn print_progress(current: usize, total: usize, elapsed: Duration) {
-    let progress = (current as f64 / total as f64 * 100.0) as u32;
-    let tps = current as f64 / elapsed.as_secs_f64();
-    println!(
-        "Progress: {}/{} ({}%) - Time elapsed: {:?} - Current TPS: {:.2}",
-        current, total, progress, elapsed, tps
-    );
-}
-
 fn benchmark_proof_generation(
     proving_key: &(ProvingKey<Bn254>, ark_relations::r1cs::ConstraintMatrices<Fr>),
     tasks: Vec<(Fr, PmTreeProof, Vec<u8>, Fr, Fr)>,
 ) -> Vec<(Proof<Bn254>, RLNProofValues, Duration)> {
-    let (tx, rx) = channel();
     let task_count = tasks.len();
     let start_time = Instant::now();
-    let progress_interval = task_count.max(10) / 10; // Show progress every 10%
-    
+    let progress_interval = task_count.max(10) / 10;
+    let completed = Arc::new(AtomicUsize::new(0));
+    let stdout_mutex = Arc::new(Mutex::new(()));
+
     println!("Starting parallel proof generation for {} transactions...", task_count);
     println!("Progress will be shown every {}% ({} transactions)\n", 10, progress_interval);
-    
-    {
-        let tx = tx;
-        let completed = Arc::new(AtomicUsize::new(0));
-        
-        tasks.into_par_iter()
-            .enumerate()
-            .for_each_with(tx, |tx, (idx, (identity_secret, merkle_proof, signal, external_nullifier, message_id))| {
-                let proof_start = Instant::now();
-                
-                let witness = rln_witness_from_values(
-                    identity_secret,
-                    &merkle_proof,
-                    hash_to_field(&signal),
-                    external_nullifier,
-                    Fr::from(100u64),
-                    message_id,
-                ).unwrap();
 
-                let proof = generate_proof(proving_key, &witness).unwrap();
-                let proof_values = proof_values_from_witness(&witness).unwrap();
-                let proof_time = proof_start.elapsed();
-                
-                tx.send((proof, proof_values, proof_time)).unwrap();
-                
-                let completed = completed.fetch_add(1, Ordering::SeqCst) + 1;
-                if completed % progress_interval == 0 || completed == task_count {
-                    let elapsed = start_time.elapsed();
-                    let current_tps = completed as f64 / elapsed.as_secs_f64();
-                    println!(
-                        "Progress: {}/{} ({}%) - Elapsed: {:.2?} - Current TPS: {:.2}",
-                        completed,
-                        task_count,
-                        (completed * 100) / task_count,
-                        elapsed,
-                        current_tps
-                    );
-                }
-            });
-    }
+    let results = tasks
+        .into_par_iter()
+        .map(|(identity_secret, merkle_proof, signal, external_nullifier, message_id)| {
+            let proof_start = Instant::now();
+            
+            let witness = rln_witness_from_values(
+                identity_secret,
+                &merkle_proof,
+                hash_to_field(&signal),
+                external_nullifier,
+                Fr::from(100u64),
+                message_id,
+            ).unwrap();
 
-    let results = rx.iter().take(task_count).collect();
+            let proof = generate_proof(proving_key, &witness).unwrap();
+            let proof_values = proof_values_from_witness(&witness).unwrap();
+            let proof_time = proof_start.elapsed();
+
+            // Progress reporting
+            let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if current % progress_interval == 0 || current == task_count {
+                let elapsed = start_time.elapsed();
+                let tps = current as f64 / elapsed.as_secs_f64();
+                let _lock = stdout_mutex.lock().unwrap();
+                println!(
+                    "Progress: {}/{} ({}%) - Elapsed: {:.2?} - Current TPS: {:.2}",
+                    current,
+                    task_count,
+                    (current * 100) / task_count,
+                    elapsed,
+                    tps
+                );
+            }
+
+            (proof, proof_values, proof_time)
+        })
+        .collect();
+
     println!("\nProof generation completed.");
     results
 }
@@ -184,7 +172,14 @@ fn main() -> Result<()> {
     
     let mut tasks = Vec::with_capacity(TOTAL_TRANSACTIONS);
     let mut tree = PoseidonTree::new(TEST_TREE_HEIGHT, Fr::from(0), Default::default())?;
-    
+
+    // Precompute external nullifiers for each epoch
+    let num_epochs = (TOTAL_TRANSACTIONS + TPS - 1) / TPS;
+    let mut external_nullifiers = Vec::with_capacity(num_epochs);
+    for epoch in 0..num_epochs {
+        external_nullifiers.push(hash_to_field(format!("epoch-{}", epoch).as_bytes()));
+    }
+
     println!("Building Merkle tree and generating tasks...");
     for i in 0..TOTAL_TRANSACTIONS {
         if i % 1000 == 0 {
@@ -196,14 +191,14 @@ fn main() -> Result<()> {
         tree.set(i, rate_commitment)?;
         
         let signal: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
-        let external_nullifier = hash_to_field(format!("epoch-{}", i / TPS).as_bytes());
+        let epoch = i / TPS;
         let merkle_proof = tree.proof(i)?;
         
         tasks.push((
             identity_secret,
             merkle_proof,
             signal,
-            external_nullifier,
+            external_nullifiers[epoch],
             Fr::from((i % 99 + 1) as u64),
         ));
     }
@@ -214,7 +209,6 @@ fn main() -> Result<()> {
     let proofs_with_times = benchmark_proof_generation(&proving_key, tasks);
     let total_gen_time = proof_gen_start.elapsed();
     
-    // Calculate average generation time before moving proofs_with_times
     let avg_gen_time: Duration = proofs_with_times.iter()
         .map(|(_, _, time)| *time)
         .sum::<Duration>() / TOTAL_TRANSACTIONS as u32;
@@ -254,4 +248,4 @@ fn main() -> Result<()> {
     println!("└─ Analysis: Negligible overhead");
 
     Ok(())
-} 
+}
