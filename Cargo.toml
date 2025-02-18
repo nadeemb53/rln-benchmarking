@@ -1,0 +1,19 @@
+[package]
+name = "rln-benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Arkworks dependencies
+ark-groth16 = "0.4.0"
+ark-relations = "0.4.0"
+ark-bn254 = "0.4.0"
+
+# Git dependencies
+rln = { git = "https://github.com/vacp2p/zerokit.git" }
+zerokit_utils = { git = "https://github.com/vacp2p/zerokit.git" }
+
+# Utility dependencies
+rand = "0.8.5"
+color-eyre = "0.6.2"
+rayon = "1.7"
