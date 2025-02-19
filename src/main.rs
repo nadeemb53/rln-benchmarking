@@ -1,269 +1,386 @@
-//! RLN Benchmarking
-//! 
-//! This benchmark simulates a rollup environment with configurable parameters
-//! 
-//! The benchmark measures three key components:
-//! 1. Proof Generation: Creating ZK proofs for each transaction
-//! 2. Proof Verification: Verifying the generated proofs
-//! 3. Blacklist Updates: Maintaining the spam prevention list
-//! 
-//! Each transaction requires:
-//! - Generating a Merkle proof
-//! - Creating a ZK proof (most computationally intensive)
-//! - Verifying the proof
-//! - Updating the blacklist
-
-use ark_groth16::{Proof, ProvingKey, VerifyingKey};
-use ark_bn254::Bn254;
+use ark_serialize::CanonicalSerialize;
+use ark_groth16::{Proof, ProvingKey};
+use ark_bn254::{Bn254, Fr};
+use ark_relations::r1cs::ConstraintMatrices;
 use rand::Rng;
 use std::time::{Duration, Instant};
 use std::collections::HashSet;
+use std::fs::File;
 use color_eyre::Result;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::env;
 use num_cpus;
-use lazy_static;
+use lazy_static::lazy_static;
+use sysinfo::{System, SystemExt, CpuExt};
+use csv::Writer;
+use std::path::Path;
 
-use rln::circuit::{Fr, TEST_TREE_HEIGHT, zkey_from_folder, vk_from_folder};
+// RLN components
+use rln::circuit::{TEST_TREE_HEIGHT, zkey_from_folder, vk_from_folder};
 use rln::poseidon_tree::PoseidonTree;
 use rln::pm_tree_adapter::PmTreeProof;
 use rln::hashers::{hash_to_field, poseidon_hash};
 use rln::protocol::{generate_proof, proof_values_from_witness, verify_proof, seeded_keygen, rln_witness_from_values, RLNProofValues};
 use zerokit_utils::merkle_tree::merkle_tree::ZerokitMerkleTree;
 
-const TPS: usize = 10;
+// Configuration
+const TPS: usize = 1000;
 const TEST_DURATION_SECS: u64 = 10;
-lazy_static::lazy_static! {
-    static ref NUM_THREADS: usize = {
-        // Get threads from env var or calculate optimal number
-        match env::var("RLN_THREADS") {
-            Ok(threads) => threads.parse().unwrap_or_else(|_| get_optimal_threads()),
-            Err(_) => get_optimal_threads(),
-        }
-    };
-}
-const TOTAL_TRANSACTIONS: usize = TPS * TEST_DURATION_SECS as usize;
+const WARMUP_PERCENT: f64 = 0.01;
+const RESOURCE_MONITOR_INTERVAL: Duration = Duration::from_secs(5);
 
-fn print_section_header(title: &str) {
-    println!("\n{}", "=".repeat(80));
-    println!("  {}", title);
-    println!("{}\n", "=".repeat(80));
+lazy_static! {
+    static ref NUM_THREADS: usize = {
+        env::var("RLN_THREADS")
+            .map(|t| t.parse().unwrap_or_else(|_| get_optimal_threads()))
+            .unwrap_or_else(|_| get_optimal_threads())
+    };
+    static ref OUTPUT_PATH: String = {
+        env::var("BENCH_OUTPUT").unwrap_or_else(|_| "benchmark_results.csv".into())
+    };
 }
 
 fn get_optimal_threads() -> usize {
-    let available_threads = num_cpus::get();
-    // Use 75% of available threads, minimum of 1
-    std::cmp::max(1, (available_threads * 3) / 4)
+    std::cmp::max(1, (num_cpus::get() * 4) / 5)
+}
+
+#[derive(Debug)]
+struct PhaseMetrics {
+    total_time: Duration,
+    avg_time: Duration,
+    p50: Duration,
+    p90: Duration,
+    p99: Duration,
+    max_mem_mb: f64,
+    avg_cpu: f64,
+    tps: f64,
+    proof_sizes: Option<Vec<usize>>,
+}
+
+struct ResourceMonitor {
+    system: System,
+    max_memory: f64,
+    cpu_readings: Vec<f64>,
+}
+
+impl ResourceMonitor {
+    fn new() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            system: System::new_all(),
+            max_memory: 0.0,
+            cpu_readings: Vec::new(),
+        }))
+    }
+
+    fn sample(monitor: &Arc<Mutex<Self>>) {
+        let mut guard = monitor.lock().unwrap();
+        guard.system.refresh_all();
+        
+        let mem_mb = guard.system.used_memory() as f64 / 1024.0 / 1024.0;
+        if mem_mb > guard.max_memory {
+            guard.max_memory = mem_mb;
+        }
+        
+        let cpu_usage = guard.system.global_cpu_info().cpu_usage() as f64;
+        guard.cpu_readings.push(cpu_usage);
+    }
+
+    fn finalize(monitor: Arc<Mutex<Self>>) -> (f64, f64) {
+        let guard = monitor.lock().unwrap();
+        let avg_cpu = guard.cpu_readings.iter().sum::<f64>() / guard.cpu_readings.len() as f64;
+        (guard.max_memory, avg_cpu)
+    }
 }
 
 fn benchmark_proof_generation(
-    proving_key: &(ProvingKey<Bn254>, ark_relations::r1cs::ConstraintMatrices<Fr>),
-    tasks: Vec<(Fr, PmTreeProof, Vec<u8>, Fr, Fr)>,
-) -> Vec<(Proof<Bn254>, RLNProofValues, Duration)> {
-    let task_count = tasks.len();
+    proving_key: &(ProvingKey<Bn254>, ConstraintMatrices<Fr>),
+    tasks: &[(Fr, PmTreeProof, Vec<u8>, Fr, Fr)],
+    monitor: Arc<Mutex<ResourceMonitor>>,
+) -> Result<(Vec<(Proof<Bn254>, RLNProofValues)>, PhaseMetrics)> {
+    println!("\n🚀 Starting {} transaction benchmark", tasks.len());
+    println!("🔧 Configuration:");
+    println!("   - Threads: {}", *NUM_THREADS);
+    println!("   - Proof System: Groth16");
+    println!("   - Circuit: RLN");
+    println!("   - Tree Depth: {}", TEST_TREE_HEIGHT);
+
+    let total_tx = tasks.len();
+    let progress_interval = (total_tx / 10).max(1);
+    let mut metrics = PhaseMetrics {
+        total_time: Duration::ZERO,
+        avg_time: Duration::ZERO,
+        p50: Duration::ZERO,
+        p90: Duration::ZERO,
+        p99: Duration::ZERO,
+        max_mem_mb: 0.0,
+        avg_cpu: 0.0,
+        tps: 0.0,
+        proof_sizes: Some(Vec::with_capacity(total_tx)),
+    };
+    
     let start_time = Instant::now();
-    let progress_interval = task_count.max(10) / 10;
-    let completed = Arc::new(AtomicUsize::new(0));
-    let stdout_mutex = Arc::new(Mutex::new(()));
-
-    println!("Starting parallel proof generation for {} transactions...", task_count);
-    println!("Progress will be shown every {}% ({} transactions)\n", 10, progress_interval);
-
+    let progress = Arc::new((AtomicUsize::new(0), Mutex::new(start_time)));
+    
     let results = tasks
         .into_par_iter()
         .map(|(identity_secret, merkle_proof, signal, external_nullifier, message_id)| {
-            let proof_start = Instant::now();
-            
-            let witness = rln_witness_from_values(
-                identity_secret,
-                &merkle_proof,
-                hash_to_field(&signal),
-                external_nullifier,
-                Fr::from(100u64),
-                message_id,
-            ).unwrap();
-
-            let proof = generate_proof(proving_key, &witness).unwrap();
-            let proof_values = proof_values_from_witness(&witness).unwrap();
-            let proof_time = proof_start.elapsed();
-
-            // Progress reporting
-            let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            if current % progress_interval == 0 || current == task_count {
-                let elapsed = start_time.elapsed();
-                let tps = current as f64 / elapsed.as_secs_f64();
-                let _lock = stdout_mutex.lock().unwrap();
+            let (counter, last_print) = &*progress;
+            let idx = counter.fetch_add(1, Ordering::Relaxed);
+            if idx % progress_interval == 0 {
+                let completed = idx + 1;
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let tps = completed as f64 / elapsed;
                 println!(
-                    "Progress: {}/{} ({}%) - Elapsed: {:.2?} - Current TPS: {:.2}",
-                    current,
-                    task_count,
-                    (current * 100) / task_count,
+                    "   █ Progress: {}/{} ({:.0}%) | Elapsed: {:.1}s | Instant TPS: {:.1}",
+                    completed,
+                    total_tx,
+                    (completed as f64 / total_tx as f64) * 100.0,
                     elapsed,
                     tps
                 );
             }
+            // Witness creation
+            let witness_start = Instant::now();
+            let witness = rln_witness_from_values(
+                *identity_secret,
+                merkle_proof,
+                hash_to_field(signal),
+                *external_nullifier,
+                Fr::from(100u64),
+                *message_id,
+            )?;
 
-            (proof, proof_values, proof_time)
-        })
-        .collect();
+            // Proof generation
+            let proof_start = Instant::now();
+            let proof = generate_proof(proving_key, &witness)?;
+            let proof_time = proof_start.elapsed();
 
-    println!("\nProof generation completed.");
-    results
-}
+            // Proof size
+            let mut serialized = Vec::new();
+            proof.serialize_compressed(&mut serialized)?;
+            let proof_size = serialized.len();
 
-fn benchmark_proof_verification(
-    verifying_key: &VerifyingKey<Bn254>,
-    proofs: Vec<(Proof<Bn254>, RLNProofValues)>,
-) -> Vec<Duration> {
-    let proof_count = proofs.len();
-    println!("Starting parallel proof verification for {} proofs...", proof_count);
-    
-    let start_time = Instant::now();
-    let verify_times: Vec<Duration> = proofs.par_iter()
-        .enumerate()
-        .map(|(idx, (proof, proof_values))| {
-            let verify_start = Instant::now();
-            verify_proof(verifying_key, proof, proof_values).unwrap();
-            let verify_time = verify_start.elapsed();
-            
-            if (idx + 1) % (proof_count / 10).max(1) == 0 {
-                println!(
-                    "Verified {}/{} proofs ({}%) - Current time: {:.2?}",
-                    idx + 1,
-                    proof_count,
-                    ((idx + 1) * 100) / proof_count,
-                    start_time.elapsed()
-                );
+            if idx % 100 == 0 {
+                let mut last = last_print.lock().unwrap();
+                if last.elapsed() >= RESOURCE_MONITOR_INTERVAL {
+                    ResourceMonitor::sample(&monitor);
+                    *last = Instant::now();
+                }
             }
-            verify_time
+
+            Ok((proof, proof_values_from_witness(&witness)?, witness_start.elapsed(), proof_time, proof_size))
         })
-        .collect();
-    
-    println!("Proof verification completed.\n");
-    verify_times
+        .collect::<Result<Vec<_>>>()?;
+
+    let (proofs, times, _witness_times, proof_sizes) = results.into_iter().fold(
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        |mut acc, (proof, values, wt, pt, size)| {
+            acc.0.push((proof, values));
+            acc.1.push(wt + pt);
+            acc.2.push(wt);
+            acc.3.push(size);
+            acc
+        },
+    );
+
+    metrics.total_time = start_time.elapsed();
+    metrics.avg_time = metrics.total_time / total_tx as u32;
+    metrics.p50 = calculate_percentile(&times, 50.0);
+    metrics.p90 = calculate_percentile(&times, 90.0);
+    metrics.p99 = calculate_percentile(&times, 99.0);
+    metrics.tps = total_tx as f64 / metrics.total_time.as_secs_f64();
+    metrics.proof_sizes.as_mut().unwrap().extend(proof_sizes);
+
+    let (max_mem, avg_cpu) = ResourceMonitor::finalize(monitor);
+    metrics.max_mem_mb = max_mem;
+    metrics.avg_cpu = avg_cpu;
+
+    println!(
+        "\n✅ Completed {} transactions in {:.2}s (avg {:.2} TPS)",
+        total_tx,
+        metrics.total_time.as_secs_f64(),
+        metrics.tps
+    );
+    println!("{}", generate_performance_report(&metrics, "Generation"));
+
+    Ok((proofs, metrics))
 }
 
-fn benchmark_blacklist_update(blacklist: &mut HashSet<usize>, updates: Vec<usize>) -> Duration {
-    let update_count = updates.len();
-    println!("Starting blacklist updates for {} entries...", update_count);
-    
-    let start = Instant::now();
-    for (idx, user_idx) in updates.into_iter().enumerate() {
-        blacklist.insert(user_idx);
-        
-        if (idx + 1) % (update_count / 10).max(1) == 0 {
-            println!(
-                "Updated {}/{} entries ({}%) - Current time: {:.2?}",
-                idx + 1,
-                update_count,
-                ((idx + 1) * 100) / update_count,
-                start.elapsed()
-            );
-        }
-    }
-    
-    let total_time = start.elapsed();
-    println!("Blacklist updates completed.\n");
-    total_time
+fn calculate_percentile(times: &[Duration], percentile: f64) -> Duration {
+    let mut sorted = times.to_vec();
+    sorted.sort();
+    let idx = (sorted.len() as f64 * percentile / 100.0).ceil() as usize - 1;
+    sorted[idx.min(sorted.len() - 1)]
 }
 
-fn main() -> Result<()> {
-    print_section_header("RLN Benchmark Configuration");
-    println!("Target TPS: {}", TPS);
-    println!("Duration: {} seconds", TEST_DURATION_SECS);
-    println!("Total Transactions: {}", TOTAL_TRANSACTIONS);
-    println!("Available CPU Threads: {}", num_cpus::get());
-    println!("Using Threads: {}", *NUM_THREADS);
+fn write_metrics(writer: &mut csv::Writer<File>, phase: &str, metrics: &PhaseMetrics) -> Result<()> {
+    writer.write_record(&[
+        phase,
+        &format!("{:.2}s", metrics.total_time.as_secs_f64()),
+        &format!("{:.2}ms", metrics.avg_time.as_secs_f64() * 1000.0),
+        &format!("{:.2}ms", metrics.p50.as_secs_f64() * 1000.0),
+        &format!("{:.2}ms", metrics.p90.as_secs_f64() * 1000.0),
+        &format!("{:.2}ms", metrics.p99.as_secs_f64() * 1000.0),
+        &format!("{:.2}", metrics.tps),
+        &format!("{:.2}MB", metrics.max_mem_mb),
+        &format!("{:.1}%", metrics.avg_cpu),
+        &metrics.proof_sizes.as_ref().map_or(0, |v| v.len()).to_string(),
+    ])?;
+    Ok(())
+}
 
-    print_section_header("Initialization");
-    println!("Loading proving and verifying keys...");
+fn generate_performance_report(metrics: &PhaseMetrics, phase: &str) -> String {
+    let per_tx_ms = metrics.avg_time.as_secs_f64() * 1000.0;
+    let proof_size_avg = metrics.proof_sizes.as_ref().map_or(0.0, |v| {
+        v.iter().sum::<usize>() as f64 / v.len() as f64
+    });
+
+    format!(
+        "{} Performance Report:
+        - Throughput: {:.2} tx/s (max theoretical)
+        - Latency: {:.2} ms per transaction (avg)
+        - Peak Memory Usage: {:.2} MB
+        - CPU Utilization: {:.1}% (avg)
+        - Proof Size: {:.2} KB (avg)
+        - Estimated 1000 tx Time: {:.2} seconds
+        - Reliability: p99 latency {:.2} ms",
+        phase,
+        metrics.tps,
+        per_tx_ms,
+        metrics.max_mem_mb,
+        metrics.avg_cpu,
+        proof_size_avg / 1024.0,
+        1000.0 / metrics.tps,
+        metrics.p99.as_secs_f64() * 1000.0
+    )
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    color_eyre::install()?;
+    let total_tx = TPS * TEST_DURATION_SECS as usize;
+    
+    let mut csv_writer = Writer::from_path(Path::new(&*OUTPUT_PATH))?;
+    csv_writer.write_record(&[
+        "Phase", "TotalTime", "AvgTime", "P50", "P90", "P99", "TPS", "MaxMemMB", "AvgCPU", "Proofs"
+    ])?;
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(*NUM_THREADS)
+        .build_global()?;
+
     let proving_key = zkey_from_folder();
     let verifying_key = vk_from_folder();
-    println!("✓ Keys loaded successfully");
 
-    let mut rng = rand::thread_rng();
-    
-    print_section_header("Test Data Preparation");
-    println!("Building Merkle tree and generating {} transactions...", TOTAL_TRANSACTIONS);
-    
-    let mut tasks = Vec::with_capacity(TOTAL_TRANSACTIONS);
     let mut tree = PoseidonTree::new(TEST_TREE_HEIGHT, Fr::from(0), Default::default())?;
+    let mut tasks = Vec::with_capacity(total_tx);
+    let mut rng = rand::thread_rng();
 
-    // Precompute external nullifiers for each epoch
-    let num_epochs = (TOTAL_TRANSACTIONS + TPS - 1) / TPS;
-    let mut external_nullifiers = Vec::with_capacity(num_epochs);
-    for epoch in 0..num_epochs {
-        external_nullifiers.push(hash_to_field(format!("epoch-{}", epoch).as_bytes()));
-    }
-
-    println!("Building Merkle tree and generating tasks...");
-    for i in 0..TOTAL_TRANSACTIONS {
-        if i % 1000 == 0 {
-            println!("Prepared {} tasks...", i);
+    for i in 0..total_tx {
+        if i % 100 == 0 {
+            tree.update_next(poseidon_hash(&[Fr::from(i as u64), Fr::from(100u64)]))?;
         }
-        
-        let (identity_secret, id_commitment) = seeded_keygen(format!("user-{}", i).as_bytes());
-        let rate_commitment = poseidon_hash(&[id_commitment, Fr::from(100u64)]);
-        tree.set(i, rate_commitment)?;
-        
-        let signal: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
-        let epoch = i / TPS;
-        let merkle_proof = tree.proof(i)?;
-        
+
+        let (id_secret, id_commit) = seeded_keygen(format!("user-{}", i).as_bytes());
+        let rate_commit = poseidon_hash(&[id_commit, Fr::from(100u64)]);
+        tree.set(i, rate_commit)?;
+
         tasks.push((
-            identity_secret,
-            merkle_proof,
-            signal,
-            external_nullifiers[epoch],
+            id_secret,
+            tree.proof(i)?,
+            (0..32).map(|_| rng.gen()).collect(),
+            hash_to_field(format!("epoch-{}", i / TPS).as_bytes()),
             Fr::from((i % 99 + 1) as u64),
         ));
     }
-    println!("Task preparation complete.");
 
-    print_section_header("Proof Generation Benchmark");
-    let proof_gen_start = Instant::now();
-    let proofs_with_times = benchmark_proof_generation(&proving_key, tasks);
-    let total_gen_time = proof_gen_start.elapsed();
-    
-    let avg_gen_time: Duration = proofs_with_times.iter()
-        .map(|(_, _, time)| *time)
-        .sum::<Duration>() / TOTAL_TRANSACTIONS as u32;
-    
-    print_section_header("Proof Verification Benchmark");
-    let proofs: Vec<(Proof<Bn254>, RLNProofValues)> = proofs_with_times.into_iter()
-        .map(|(proof, values, _)| (proof, values))
-        .collect();
-    
+    // Split tasks into warmup and main
+    let warmup_tx = (total_tx as f64 * WARMUP_PERCENT) as usize;
+    let (warmup_tasks, main_tasks) = tasks.split_at(warmup_tx);
+
+    // Warm-up phase
+    let warmup_mon = ResourceMonitor::new();
+    let (_, warmup_metrics) = benchmark_proof_generation(
+        &proving_key,
+        &warmup_tasks,
+        warmup_mon.clone(),
+    )?;
+    write_metrics(&mut csv_writer, "Warmup", &warmup_metrics)?;
+
+    // Main benchmark
+    let main_mon = ResourceMonitor::new();
+    let (proofs, gen_metrics) = benchmark_proof_generation(
+        &proving_key,
+        &main_tasks,
+        main_mon.clone(),
+    )?;
+    write_metrics(&mut csv_writer, "Generation", &gen_metrics)?;
+
+    // Verification phase
     let verify_start = Instant::now();
-    let verify_times = benchmark_proof_verification(&verifying_key, proofs);
-    let total_verify_time = verify_start.elapsed();
+    let verify_times = proofs.par_iter()
+        .map(|(proof, values)| {
+            let start = Instant::now();
+            verify_proof(&verifying_key, proof, values)?;
+            Ok(start.elapsed())
+        })
+        .collect::<Result<Vec<_>>>()?;
     
-    let avg_verify_time: Duration = verify_times.iter().sum::<Duration>() / TOTAL_TRANSACTIONS as u32;
-    
-    print_section_header("Blacklist Update Benchmark");
+    let (max_mem, avg_cpu) = ResourceMonitor::finalize(main_mon.clone());
+    let verify_metrics = PhaseMetrics {
+        total_time: verify_start.elapsed(),
+        avg_time: verify_times.iter().sum::<Duration>() / total_tx as u32,
+        p50: calculate_percentile(&verify_times, 50.0),
+        p90: calculate_percentile(&verify_times, 90.0),
+        p99: calculate_percentile(&verify_times, 99.0),
+        max_mem_mb: max_mem,
+        avg_cpu,
+        tps: total_tx as f64 / verify_start.elapsed().as_secs_f64(),
+        proof_sizes: None,
+    };
+    write_metrics(&mut csv_writer, "Verification", &verify_metrics)?;
+
+    // Blacklist benchmark
+    let blacklist_start = Instant::now();
     let mut blacklist = HashSet::new();
-    let updates: Vec<usize> = (0..TOTAL_TRANSACTIONS).collect();
+    (0..total_tx).for_each(|i| { blacklist.insert(i); });
     
-    let blacklist_time = benchmark_blacklist_update(&mut blacklist, updates);
-    
-    print_section_header("Final Benchmark Results");
-    println!("\nProof Generation Performance:");
-    println!("├─ Total time: {:?}", total_gen_time);
-    println!("├─ Average per proof: {:?}", avg_gen_time);
-    println!("├─ Effective TPS: {:.2}", TOTAL_TRANSACTIONS as f64 / total_gen_time.as_secs_f64());
+    let blacklist_metrics = PhaseMetrics {
+        total_time: blacklist_start.elapsed(),
+        avg_time: blacklist_start.elapsed() / total_tx as u32,
+        p50: blacklist_start.elapsed() / total_tx as u32,
+        p90: blacklist_start.elapsed() / total_tx as u32,
+        p99: blacklist_start.elapsed() / total_tx as u32,
+        max_mem_mb: max_mem,
+        avg_cpu,
+        tps: total_tx as f64 / blacklist_start.elapsed().as_secs_f64(),
+        proof_sizes: None,
+    };
+    write_metrics(&mut csv_writer, "Blacklist", &blacklist_metrics)?;
+    let final_report = format!(
+        "\n📈 Final Performance Summary:
+        Total System Throughput: {:.2} tx/s
+        Verification Efficiency: {:.2} ms/verify
+        Resource Utilization:
+          - Peak Memory: {:.2} MB
+          - Average CPU: {:.1}%
+        Capacity Planning:
+          - 1,000 tx would take: {:.2} seconds
+          - 10,000 tx would take: {:.2} minutes
+          - Max Daily Capacity: {:.2} million tx",
+        gen_metrics.tps,
+        verify_metrics.avg_time.as_secs_f64() * 1000.0,
+        gen_metrics.max_mem_mb,
+        gen_metrics.avg_cpu,
+        1000.0 / gen_metrics.tps,
+        (10000.0 / gen_metrics.tps) / 60.0,
+        (gen_metrics.tps * 86400.0) / 1_000_000.0
+    );
 
-    println!("\nProof Verification Performance:");
-    println!("├─ Total time: {:?}", total_verify_time);
-    println!("├─ Average per verification: {:?}", avg_verify_time);
-    println!("├─ Effective TPS: {:.2}", TOTAL_TRANSACTIONS as f64 / total_verify_time.as_secs_f64());
-
-    println!("\nBlacklist Update Performance:");
-    println!("├─ Total time: {:?}", blacklist_time);
-    println!("├─ Average per update: {:?}", blacklist_time / TOTAL_TRANSACTIONS as u32);
-    println!("├─ Updates per second: {:.2}", TOTAL_TRANSACTIONS as f64 / blacklist_time.as_secs_f64());
-    println!("└─ Analysis: Negligible overhead");
-
+    println!("{}", final_report);
+    std::fs::write("performance_summary.txt", final_report)?;
+    println!("\n📄 Benchmark report saved to {}", *OUTPUT_PATH);
     Ok(())
 }
