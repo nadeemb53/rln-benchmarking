@@ -6,7 +6,7 @@ use rand::Rng;
 use std::time::{Duration, Instant};
 use std::collections::HashSet;
 use std::fs::File;
-use color_eyre::Result;
+use color_eyre::{Result, Report};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,7 +18,6 @@ use csv::Writer;
 use std::path::Path;
 
 // RLN components
-use rln::circuit::{TEST_TREE_HEIGHT, zkey_from_folder, vk_from_folder};
 use rln::poseidon_tree::PoseidonTree;
 use rln::pm_tree_adapter::PmTreeProof;
 use rln::hashers::{hash_to_field, poseidon_hash};
@@ -26,10 +25,14 @@ use rln::protocol::{generate_proof, proof_values_from_witness, verify_proof, see
 use zerokit_utils::merkle_tree::merkle_tree::ZerokitMerkleTree;
 
 // Configuration
-const TPS: usize = 1000;
+const TPS: usize = 100;
 const TEST_DURATION_SECS: u64 = 10;
-const WARMUP_PERCENT: f64 = 0.01;
+const WARMUP_PERCENT: f64 = 0.1;
 const RESOURCE_MONITOR_INTERVAL: Duration = Duration::from_secs(5);
+const BENCH_TREE_HEIGHT: usize = 10;
+
+const ZKEY_HEIGHT_10: &[u8] = include_bytes!("../resources/tree_height_10/rln_final.zkey");
+const GRAPH_HEIGHT_10: &[u8] = include_bytes!("../resources/tree_height_10/graph.bin");
 
 lazy_static! {
     static ref NUM_THREADS: usize = {
@@ -104,7 +107,7 @@ fn benchmark_proof_generation(
     println!("   - Threads: {}", *NUM_THREADS);
     println!("   - Proof System: Groth16");
     println!("   - Circuit: RLN");
-    println!("   - Tree Depth: {}", TEST_TREE_HEIGHT);
+    println!("   - Tree Depth: {}", BENCH_TREE_HEIGHT);
 
     let total_tx = tasks.len();
     let progress_interval = (total_tx / 10).max(1);
@@ -154,7 +157,7 @@ fn benchmark_proof_generation(
 
             // Proof generation
             let proof_start = Instant::now();
-            let proof = generate_proof(proving_key, &witness)?;
+            let proof = generate_proof(proving_key, &witness, GRAPH_HEIGHT_10)?;
             let proof_time = proof_start.elapsed();
 
             // Proof size
@@ -257,6 +260,14 @@ fn generate_performance_report(metrics: &PhaseMetrics, phase: &str) -> String {
     )
 }
 
+// Helper function to load tree height 10 zkey from bytes
+fn zkey_from_raw_height_10() -> Result<(ProvingKey<Bn254>, ConstraintMatrices<Fr>)> {
+    use std::io::Cursor;
+    
+    let mut reader = Cursor::new(ZKEY_HEIGHT_10);
+    ark_circom::read_zkey(&mut reader).map_err(|e| Report::msg(format!("Failed to read zkey: {}", e)))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -271,10 +282,12 @@ async fn main() -> Result<()> {
         .num_threads(*NUM_THREADS)
         .build_global()?;
 
-    let proving_key = zkey_from_folder();
-    let verifying_key = vk_from_folder();
+    // Load tree height 10 resources
+    let pk_and_matrices = zkey_from_raw_height_10()?;
+    let verifying_key = pk_and_matrices.0.vk.clone();
 
-    let mut tree = PoseidonTree::new(TEST_TREE_HEIGHT, Fr::from(0), Default::default())?;
+    // Use tree height 10 for the Merkle tree
+    let mut tree = PoseidonTree::new(BENCH_TREE_HEIGHT, Fr::from(0), Default::default())?;
     let mut tasks = Vec::with_capacity(total_tx);
     let mut rng = rand::thread_rng();
 
@@ -303,7 +316,7 @@ async fn main() -> Result<()> {
     // Warm-up phase
     let warmup_mon = ResourceMonitor::new();
     let (_, warmup_metrics) = benchmark_proof_generation(
-        &proving_key,
+        &pk_and_matrices,
         &warmup_tasks,
         warmup_mon.clone(),
     )?;
@@ -312,7 +325,7 @@ async fn main() -> Result<()> {
     // Main benchmark
     let main_mon = ResourceMonitor::new();
     let (proofs, gen_metrics) = benchmark_proof_generation(
-        &proving_key,
+        &pk_and_matrices,
         &main_tasks,
         main_mon.clone(),
     )?;
