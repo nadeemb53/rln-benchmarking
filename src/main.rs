@@ -25,11 +25,11 @@ use rln::protocol::{generate_proof, proof_values_from_witness, verify_proof, see
 use zerokit_utils::merkle_tree::merkle_tree::ZerokitMerkleTree;
 
 // Configuration
-const TPS: usize = 100;
-const TEST_DURATION_SECS: u64 = 10;
+const TPS: usize = 1000;
+const TEST_DURATION_SECS: u64 = 100;
 const WARMUP_PERCENT: f64 = 0.1;
 const RESOURCE_MONITOR_INTERVAL: Duration = Duration::from_secs(5);
-const BENCH_TREE_HEIGHT: usize = 10;
+const BENCH_TREE_HEIGHT: usize = 22;
 
 const ZKEY_HEIGHT_10: &[u8] = include_bytes!("../resources/tree_height_10/rln_final.zkey");
 const GRAPH_HEIGHT_10: &[u8] = include_bytes!("../resources/tree_height_10/graph.bin");
