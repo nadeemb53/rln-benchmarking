@@ -9,6 +9,7 @@ ark-groth16 = "0.4.0"
 ark-relations = "0.4.0"
 ark-bn254 = "0.4.0"
 ark-serialize = "0.4.0"
+ark-circom = { git = "https://github.com/gakonst/ark-circom.git", rev = "7f80002" }
 
 # Git dependencies
 rln = { git = "https://github.com/vacp2p/zerokit.git" }
